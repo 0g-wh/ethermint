@@ -748,8 +748,8 @@ func getBaseFee(ctx context.Context, client types.QueryClient, blockRes *tmrpcty
 		// we can't tell if it's london HF not enabled or the state is pruned,
 		// in either case, we'll fallback to parsing from begin blocker event,
 		// faster to iterate reversely
-		for i := len(blockRes.BeginBlockEvents) - 1; i >= 0; i-- {
-			evt := blockRes.BeginBlockEvents[i]
+		for i := len(blockRes.FinalizeBlockEvents) - 1; i >= 0; i-- {
+			evt := blockRes.FinalizeBlockEvents[i]
 			if evt.Type == feemarkettypes.EventTypeFeeMarket && len(evt.Attributes) > 0 {
 				baseFee, err := strconv.ParseInt(evt.Attributes[0].Value, 10, 64)
 				if err == nil {
@@ -835,8 +835,8 @@ func fixBaseFee(ctx context.Context, queryClient *types.QueryClient, header *typ
 		// we can't tell if it's london HF not enabled or the state is pruned,
 		// in either case, we'll fallback to parsing from begin blocker event,
 		// faster to iterate reversely
-		for i := len(resBlock.BeginBlockEvents) - 1; i >= 0; i-- {
-			evt := resBlock.BeginBlockEvents[i]
+		for i := len(resBlock.FinalizeBlockEvents) - 1; i >= 0; i-- {
+			evt := resBlock.FinalizeBlockEvents[i]
 			if evt.Type == feemarkettypes.EventTypeFeeMarket && len(evt.Attributes) > 0 {
 				baseFee, err := strconv.ParseInt(evt.Attributes[0].Value, 10, 64)
 				if err == nil {
@@ -851,7 +851,7 @@ func fixBaseFee(ctx context.Context, queryClient *types.QueryClient, header *typ
 }
 
 func fixBloom(header *types.EthHeader, resBlock *tmrpctypes.ResultBlockResults) {
-	for _, event := range resBlock.EndBlockEvents {
+	for _, event := range resBlock.FinalizeBlockEvents {
 		if event.Type != evmtypes.EventTypeBlockBloom {
 			continue
 		}
