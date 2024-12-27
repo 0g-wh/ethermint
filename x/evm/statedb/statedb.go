@@ -29,11 +29,12 @@ import (
 )
 
 // revision is the identifier of a version of state.
-// it consists of an auto-increment id and a journal index.
-// it's safer to use than using journal index alone.
+// it consists of an auto-increment id, a snapshot index and a journal index.
+// The tuple (snapshotIndex, journalIndex) are incremental in valid revisions of a state db.
 type revision struct {
-	id           int
-	journalIndex int
+	id            int
+	snapshotIndex int
+	journalIndex  int
 }
 
 var _ vm.StateDB = &StateDB{}
@@ -46,10 +47,15 @@ var _ vm.StateDB = &StateDB{}
 type StateDB struct {
 	keeper Keeper
 	ctx    sdk.Context
+	// we will have this only when there are precompile calls
+	// it refers to the cachedCtx in latest cached multi store snapshots
+	cachedCtx sdk.Context
+	hasCache  bool
 
 	// Journal of state modifications. This is the backbone of
 	// Snapshot and RevertToSnapshot.
 	journal        *journal
+	snapshots      *stateDBSnapshots
 	validRevisions []revision
 	nextRevisionID int
 
@@ -72,9 +78,13 @@ func New(ctx sdk.Context, keeper Keeper, txConfig TxConfig) *StateDB {
 	return &StateDB{
 		keeper:       keeper,
 		ctx:          ctx,
+		hasCache:     false,
 		stateObjects: make(map[common.Address]*stateObject),
 		journal:      newJournal(),
-		accessList:   newAccessList(),
+		snapshots: &stateDBSnapshots{
+			snapshots: make([]stateDBSnapshot, 0),
+		},
+		accessList: newAccessList(),
 
 		txConfig: txConfig,
 	}
@@ -82,6 +92,9 @@ func New(ctx sdk.Context, keeper Keeper, txConfig TxConfig) *StateDB {
 
 // GetContext returns the transaction Context.
 func (s *StateDB) GetContext() sdk.Context {
+	if s.hasCache {
+		return s.cachedCtx
+	}
 	return s.ctx
 }
 
@@ -227,7 +240,7 @@ func (s *StateDB) getStateObject(addr common.Address) *stateObject {
 		return obj
 	}
 	// If no live objects are available, load it from keeper
-	account := s.keeper.GetAccount(s.ctx, addr)
+	account := s.keeper.GetAccount(s.GetContext(), addr)
 	if account == nil {
 		return nil
 	}
@@ -287,7 +300,7 @@ func (s *StateDB) ForEachStorage(addr common.Address, cb func(key, value common.
 	if so == nil {
 		return nil
 	}
-	s.keeper.ForEachStorage(s.ctx, addr, func(key, value common.Hash) bool {
+	s.keeper.ForEachStorage(s.GetContext(), addr, func(key, value common.Hash) bool {
 		if value, dirty := so.dirtyStorage[key]; dirty {
 			return cb(key, value)
 		}
@@ -433,7 +446,11 @@ func (s *StateDB) SlotInAccessList(addr common.Address, slot common.Hash) (addre
 func (s *StateDB) Snapshot() int {
 	id := s.nextRevisionID
 	s.nextRevisionID++
-	s.validRevisions = append(s.validRevisions, revision{id, s.journal.length()})
+	s.validRevisions = append(s.validRevisions, revision{
+		id:            id,
+		snapshotIndex: len(s.snapshots.snapshots),
+		journalIndex:  s.journal.length(),
+	})
 	return id
 }
 
@@ -448,25 +465,39 @@ func (s *StateDB) RevertToSnapshot(revid int) {
 	}
 	snapshot := s.validRevisions[idx].journalIndex
 
+	// Revert to the correct snapshot before replaying journal
+	s.snapshots.Revert(s, s.validRevisions[idx].snapshotIndex)
 	// Replay the journal to undo changes and remove invalidated snapshots
 	s.journal.Revert(s, snapshot)
 	s.validRevisions = s.validRevisions[:idx]
 }
 
+// GetCachedContextForPrecompile create a new cached context with deep copied multi store and all
+// dirtied EVM journals committed. To be called at the beginning of every precompile module.
+func (s *StateDB) GetCachedContextForPrecompile() (sdk.Context, error) {
+	return s.snapshots.GetCachedContextForPrecompile(s)
+}
+
+func (s *StateDB) Commit() error {
+	s.snapshots.Commit(s)
+	return s.commitToContext(s.ctx)
+}
+
 // Commit writes the dirty states to keeper
 // the StateDB object should be discarded after committed.
-func (s *StateDB) Commit() error {
+func (s *StateDB) commitToContext(ctx sdk.Context) error {
 	for _, addr := range s.journal.sortedDirties() {
+		// commit journal
 		obj := s.stateObjects[addr]
 		if obj.suicided {
-			if err := s.keeper.DeleteAccount(s.ctx, obj.Address()); err != nil {
+			if err := s.keeper.DeleteAccount(ctx, obj.Address()); err != nil {
 				return errorsmod.Wrap(err, "failed to delete account")
 			}
 		} else {
 			if obj.code != nil && obj.dirtyCode {
-				s.keeper.SetCode(s.ctx, obj.CodeHash(), obj.code)
+				s.keeper.SetCode(ctx, obj.CodeHash(), obj.code)
 			}
-			if err := s.keeper.SetAccount(s.ctx, obj.Address(), obj.account); err != nil {
+			if err := s.keeper.SetAccount(ctx, obj.Address(), obj.account); err != nil {
 				return errorsmod.Wrap(err, "failed to set account")
 			}
 			for _, key := range obj.dirtyStorage.SortedKeys() {
@@ -475,7 +506,7 @@ func (s *StateDB) Commit() error {
 				if value == obj.originStorage[key] {
 					continue
 				}
-				s.keeper.SetState(s.ctx, obj.Address(), key, value.Bytes())
+				s.keeper.SetState(ctx, obj.Address(), key, value.Bytes())
 			}
 		}
 	}
